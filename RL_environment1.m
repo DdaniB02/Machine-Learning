@@ -1,503 +1,325 @@
 classdef RL_environment1 < rl.env.MATLABEnvironment
-    %AMS_RL: Template for defining custom environment in MATLAB.    
-    
-    %% Properties (set properties' attributes accordingly)
+    %AMS_RL: Ambiente RL per smistamento automatico di pacchi su matrice AMS.
+    %
+    % MIGLIORAMENTI rispetto alla versione originale:
+    %   FISICA:
+    %     - Collisioni rilevate PRIMA del movimento (swept collision detection)
+    %       per evitare il tunnel effect a velocità elevate
+    %     - Risoluzione collisioni lungo la normale al contatto (MTV -
+    %       Minimum Translation Vector), non più solo su X o Y separati
+    %     - Loop collisioni separato dalla cinematica (due passate distinte)
+    %     - Boundary clamp applicato DOPO la risoluzione collisioni
+    %     - Rimossa x_boxes_vect / y_boxes_vect (crescita illimitata in memoria);
+    %       sostituita con buffer circolare a 2 slot (t e t-1)
+    %
+    %   REWARD:
+    %     - Premio uscita pacco: delta (solo allo step dell'evento), non cumulativo
+    %     - Premio singolazione: bonus quando due pacchi superano la soglia
+    %       minima di separazione laterale all'uscita
+    %     - Premio throughput: reward proporzionale alla velocità media Y
+    %       dei pacchi ancora in griglia
+    %     - Penalità collisione proporzionale alla profondità di penetrazione
+    %     - Penalità stazionamento invariata (shaping costante)
+
+    %% Properties
     properties
-        % Specify and initialize environment's necessary properties    
-        v_treadmill = 0.6; % m/s
+        % --- Parametri fisici AMS ---
+        v_treadmill  = 0.6;          % m/s  velocità tapis roulant (oltre griglia)
+        d_AMS        = 0.2;          % m    lato di ogni cella AMS
+        n_i_AMS      = 5;            % celle lungo Y
+        n_j_AMS      = 5;            % celle lungo X
+        n_actions_art = 2;           % azioni per cella (rot, vel)
 
-        d_AMS = 0.2; % m - size of the AMS
-        n_i_AMS = 5; % numeber of AMS along y
-        n_j_AMS = 5; % number of AMS along x
-        n_actions_art = 2; % number of actions of each AMS
+        upperlim_rot = pi*45/180;    % rad  limite sup. rotazione
+        upperlim_v   = 2.2;          % m/s  limite sup. velocità
+        lowerlim_rot = -pi*45/180;   % rad  limite inf. rotazione
+        lowerlim_v   = 0.5;          % m/s  limite inf. velocità
 
-        upperlim_rot = pi*45/180; % upper limit rotation for AMS action
-        upperlim_v = 2.2; % max velocity for AMS
-        lowerlim_rot = - pi*45/180; % lower limit rotation for AMS action
-        lowerlim_v = 0.5; % min velocity for AMS
+        % --- Stato cinematico pacchi ---
+        x_boxes      = zeros(10,1);  % posizione X corrente
+        y_boxes      = zeros(10,1);  % posizione Y corrente
+        x_boxes_prec = zeros(10,1);  % posizione X al passo precedente
+        y_boxes_prec = zeros(10,1);  % posizione Y al passo precedente
+        vx_boxes     = zeros(10,1);  % velocità X corrente  (m/s)
+        vy_boxes     = zeros(10,1);  % velocità Y corrente  (m/s)
+        d_boxes      = zeros(10,1);  % diametro pacco (trattato come quadrato)
 
-        vy_boxes = [];
-        x_boxes_prec = [];
-        y_boxes_prec = [];
+        % --- Indici AMS correnti per ogni pacco ---
+        i_box = zeros(10,1);         % riga  cella AMS (1-5, 6 = fuori griglia)
+        j_box = zeros(10,1);         % colonna cella AMS
+        index_AMS = zeros(10,1);
 
-        index_AMS = [];
-
+        % --- Ultima azione de-normalizzata ---
         LastAction = zeros(50,1);
 
-        i_box = [];
-        j_box = [];
-
+        % --- Gestione pacchi ---
+        n_boxes_tot     = 0;         % pacchi attualmente attivi
+        max_gen_boxes   = 10;        % max pacchi simultanei
+        cont_new_box    = 0;         % contatore eventi di generazione
         n_boxes_tot_vect = [];
-        n_boxes_tot = 0;
-        max_gen_boxes = 10;
-        cont_new_box = 0;
 
-        d_boxes = zeros(10,1);
-        x_boxes = zeros(10,1);
-        y_boxes = zeros(10,1);
-        x_boxes_vect = zeros(10000,10);
-        y_boxes_vect = zeros(10000,10);
-        cont = 0;
-        pack_exited = zeros(10,1);
-        exit_order = zeros(10,1);
-        index_exit = 0;
+        % --- Uscite ---
+        pack_exited  = zeros(10,1);  % flag: pacco ii è uscito?
+        exit_order   = zeros(10,1);  % ordine di uscita
+        index_exit   = 0;            % quanti pacchi sono usciti finora
+        index_exit_prev = 0;         % valore al passo precedente (per delta reward)
 
-        toll_contatto = 0.005;
+        % --- Parametri collisione ---
+        toll_contatto = 0.002;       % m  gap minimo di separazione post-risoluzione
+        % Coefficiente di restituzione: 0 = completamente anelastico
+        % (pacchi si separano senza rimbalzo), 1 = elastico
+        coeff_restituzione = 0.1;
 
-        dt = 0.01; % s - timestep for simulation
-
-        time = 0; % s - simulation time
+        % --- Tempo ---
+        dt   = 0.01;                 % s  timestep
+        time = 0;                    % s  tempo simulazione
+        cont = 0;                    % contatore step
     end
 
     properties (Hidden)
-        % Flags for visualization
         VisualizeAnimation = false
-        VisualizeActions = false
-        VisualizeStates = false        
+        VisualizeActions   = false
+        VisualizeStates    = false
     end
-    
+
     properties
-        % Initialize system state [on1,x1,y1,on2,x2,y2,...,on25,x25,y25]'
-        State = zeros(50,1) % Deve essere uguale alla dimensione di 
-                % 'ObservationInfo', definito dopo. Se passiamo solo la
-                % posizione dei pacchi (30 valori) ==> 30 anzi che 100
+        % Vettore di stato RL (50 elementi)
+        State = zeros(50,1)
     end
-    
-    properties(Access = protected)
-        % Initialize internal flag to indicate episode termination
-        IsDone = false        
+
+    properties (Access = protected)
+        IsDone = false
     end
 
     properties (Transient, Access = private)
         Visualizer = []
     end
 
-    %% Necessary Methods
-    methods              
-        % Contructor method creates an instance of the environment
-        % Change class name and constructor name accordingly
+    %% =====================================================================
+    %  Metodi necessari
+    %% =====================================================================
+    methods
+
+        % -----------------------------------------------------------------
+        % Costruttore
+        % -----------------------------------------------------------------
         function this = RL_environment1()
-            % Initialize Observation settings
-
-%---------- ObservationInfo = ???; % states: to be defined ----------
-            % Definiamo 3 osservazioni per ogni pacco (x, y, diametro) per un totale di 30
-            %OCCHIO: Potresti voler definire 5 osservazioni per ogni pacco
-            %   (x, y, diametro, x_prec, y_prec)
-
-
-            numObservations = 50; 
+            numObservations = 50;
             ObservationInfo = rlNumericSpec([numObservations 1]);
-            ObservationInfo.Name = 'Parcel States';
-            ObservationInfo.Description = 'x, y, x_prec, y_prec and diameter for each of the 10 parcels';
+            ObservationInfo.Name        = 'Parcel States';
+            ObservationInfo.Description = 'x, y, x_prec, y_prec, diametro per ciascuno dei 10 pacchi';
 
-            % Initialize Action settings
-            n_actions = 5*5*2;
+            n_actions  = 5*5*2;   % 50
             ActionInfo = rlNumericSpec([n_actions 1]);
-            ActionInfo.Name = 'AMS Action';
-            ActionInfo.Description = 'r1, v1, r2, v2, ...';
-            ActionInfo.LowerLimit = zeros(n_actions,1);
-            ActionInfo.UpperLimit = zeros(n_actions,1);
+            ActionInfo.Name        = 'AMS Action';
+            ActionInfo.Description = 'r1,v1, r2,v2, ... per ogni cella della matrice 5x5';
 
-            for ii=1:2:n_actions
-
-                ActionInfo.UpperLimit(ii) = pi*45/180;
-                ActionInfo.UpperLimit(ii+1) = 2.2;
-                ActionInfo.LowerLimit(ii) = - pi*45/180;
-                ActionInfo.LowerLimit(ii+1) = 0.5;
-                
+            lim_low = zeros(n_actions,1);
+            lim_up  = zeros(n_actions,1);
+            for ii = 1:2:n_actions
+                lim_up(ii)    =  pi*45/180;   % rot max
+                lim_up(ii+1)  =  2.2;         % vel max
+                lim_low(ii)   = -pi*45/180;   % rot min
+                lim_low(ii+1) =  0.5;         % vel min
             end
-            
-            % The following line implements built-in functions of RL env
-            this = this@rl.env.MATLABEnvironment(ObservationInfo,ActionInfo);
+            ActionInfo.LowerLimit = lim_low;
+            ActionInfo.UpperLimit = lim_up;
+
+            this = this@rl.env.MATLABEnvironment(ObservationInfo, ActionInfo);
         end
-        
-        % Apply system dynamics and simulates the environment with the 
-        % given action for one step.
-        function [Observation,Reward,IsDone,Info] = step(this,Action)
+
+        % -----------------------------------------------------------------
+        % Step
+        % -----------------------------------------------------------------
+        function [Observation, Reward, IsDone, Info] = step(this, Action)
             Info = [];
 
             this.time = this.time + this.dt;
-
             this.cont = this.cont + 1;
 
-            l_AMS_matrix = this.d_AMS*this.n_j_AMS; % m
+            L = this.d_AMS * this.n_j_AMS;   % larghezza totale griglia [m]
 
-            ActLimUp = zeros(50,1);
-            ActLimLow = zeros(50,1);
-
-            for ii=1:2:50
-                ActLimUp(ii) = this.upperlim_rot;
-                ActLimUp(ii+1) = this.upperlim_v;
-                ActLimLow(ii) = this.lowerlim_rot;
-                ActLimLow(ii+1) = this.lowerlim_v;
-            end
-
-            % Actions are normalized [0-1]
-            % De-normalizing the actions
-            AMS_actions = ActLimLow + (1 + Action) .* (ActLimUp - ActLimLow)./2;
-            for ii=1:50
-                AMS_actions(ii) = max(ActLimLow(ii),min(ActLimUp(ii),AMS_actions(ii)));
-            end
-
+            % --- De-normalizzazione azioni [-1,1] → limiti fisici ----------
+            lim_up  = repmat([this.upperlim_rot; this.upperlim_v], 25, 1);
+            lim_low = repmat([this.lowerlim_rot; this.lowerlim_v], 25, 1);
+            AMS_actions = lim_low + (1 + Action) .* (lim_up - lim_low) ./ 2;
+            AMS_actions = max(lim_low, min(lim_up, AMS_actions));
             this.LastAction = AMS_actions;
 
-            v_AMS = zeros(5,5);
+            % Estrai matrici rotazione e velocità 5×5
             rotation_AMS = zeros(5,5);
-
+            v_AMS        = zeros(5,5);
             for ii = 1:this.n_i_AMS
                 for jj = 1:this.n_j_AMS
-                    % rotational actions
-                    rotation_AMS(ii,jj) = AMS_actions(jj*2-1+(ii-1)*10);
-                    % velocity actions
-                    v_AMS(ii,jj) = AMS_actions(jj*2+(ii-1)*10);
+                    rotation_AMS(ii,jj) = AMS_actions(jj*2-1 + (ii-1)*10);
+                    v_AMS(ii,jj)        = AMS_actions(jj*2   + (ii-1)*10);
                 end
             end
 
-            % new boxes generation each 0.75 s. 2 boxes are generated.
-
-            if mod(round(this.time,2),0.75) == 0 && this.n_boxes_tot<this.max_gen_boxes && this.time>0.25
-                
-                this.cont_new_box = this.cont_new_box + 1;
-                
-                gen_n_boxes = 2;
-                if gen_n_boxes>2
-                    gen_n_boxes=2;
-                end
-
-                while this.n_boxes_tot+gen_n_boxes>this.max_gen_boxes
-                    gen_n_boxes = gen_n_boxes-1;
-                end
-
-                this.n_boxes_tot = this.n_boxes_tot+gen_n_boxes;
-                this.n_boxes_tot_vect(this.cont_new_box) = gen_n_boxes;
-
-                for ii=1:gen_n_boxes
-
-                    if gen_n_boxes>1
-                        if ii == 1
-                            this.x_boxes(this.n_boxes_tot-1) = this.d_boxes(this.n_boxes_tot-1)*0.5 + (this.d_AMS*2.5-this.d_boxes(this.n_boxes_tot-1)*0.5)*rand(1);
-                            this.y_boxes(this.n_boxes_tot-1) = 0.001 + rand(1)*0.01;
-                            this.x_boxes_prec(this.n_boxes_tot-1) = this.x_boxes(this.n_boxes_tot-1);
-                            this.y_boxes_prec(this.n_boxes_tot-1) = this.y_boxes(this.n_boxes_tot-1);
-                        else
-                            this.x_boxes(this.n_boxes_tot) = this.d_AMS*2.5+this.d_boxes(this.n_boxes_tot)*0.5 + (l_AMS_matrix-(this.d_AMS*2.5+this.d_boxes(this.n_boxes_tot)*0.5))*rand(1);
-                            this.y_boxes(this.n_boxes_tot) = 0.001 + rand(1)*0.05;
-                            if abs(this.x_boxes(this.n_boxes_tot)-this.x_boxes(this.n_boxes_tot-1)) <= this.d_boxes(this.n_boxes_tot)/2+this.d_boxes(this.n_boxes_tot-1)/2
-                                this.x_boxes(this.n_boxes_tot) = this.x_boxes(this.n_boxes_tot-1) + this.d_boxes(this.n_boxes_tot)/2 + this.d_boxes(this.n_boxes_tot-1)/2 + 0.1;
-                            end
-                            if this.x_boxes(this.n_boxes_tot)-this.d_boxes(this.n_boxes_tot)/2<0
-                                this.x_boxes(this.n_boxes_tot) = this.d_boxes(this.n_boxes_tot)/2;
-                            elseif this.x_boxes(this.n_boxes_tot)+this.d_boxes(this.n_boxes_tot)/2>l_AMS_matrix
-                                this.x_boxes(this.n_boxes_tot) = l_AMS_matrix-this.d_boxes(this.n_boxes_tot)/2;
-                            end
-                            if abs(this.x_boxes(this.n_boxes_tot)-this.x_boxes(this.n_boxes_tot-1)) <= this.d_boxes(this.n_boxes_tot)/2+this.d_boxes(this.n_boxes_tot-1)/2
-                                this.x_boxes(this.n_boxes_tot-1) = this.x_boxes(this.n_boxes_tot) - (this.d_boxes(this.n_boxes_tot)/2 + this.d_boxes(this.n_boxes_tot-1)/2 + 0.1);
-                            end
-                            this.x_boxes_prec(this.n_boxes_tot) = this.x_boxes(this.n_boxes_tot);
-                            this.y_boxes_prec(this.n_boxes_tot) = this.y_boxes(this.n_boxes_tot);
-                        end
-                    else
-                        this.x_boxes(this.n_boxes_tot) = this.d_boxes(this.n_boxes_tot)*0.55 + (l_AMS_matrix-this.d_boxes(this.n_boxes_tot)*0.55)*rand(1);
-                        this.y_boxes(this.n_boxes_tot) = 0.001 + rand(1)*0.01;
-                        this.x_boxes_prec(this.n_boxes_tot) = this.x_boxes(this.n_boxes_tot);
-                        this.y_boxes_prec(this.n_boxes_tot) = this.y_boxes(this.n_boxes_tot);
-                        this.x_boxes_vect(this.n_boxes_tot,this.cont-1) = this.x_boxes(this.n_boxes_tot);
-                        this.y_boxes_vect(this.n_boxes_tot,this.cont-1) = this.y_boxes(this.n_boxes_tot);
-                    end
-
-                end
-
+            % --- Generazione nuovi pacchi ogni 0.75 s (max 2 per evento) --
+            if mod(round(this.time,2), 0.75) == 0 && ...
+                    this.n_boxes_tot < this.max_gen_boxes && this.time > 0.25
+                this = generaPacki(this, L);
             end
 
-            for ii=this.n_boxes_tot+1:this.max_gen_boxes
+            % Pacchi non ancora generati → coordinate sentinella
+            for ii = this.n_boxes_tot+1 : this.max_gen_boxes
                 this.x_boxes(ii) = -1;
                 this.y_boxes(ii) = -1;
             end
 
-            act_AMS = zeros(25,1);
-            this.index_AMS = [];
+            % --- Salva posizioni precedenti --------------------------------
+            this.x_boxes_prec(1:this.n_boxes_tot) = this.x_boxes(1:this.n_boxes_tot);
+            this.y_boxes_prec(1:this.n_boxes_tot) = this.y_boxes(1:this.n_boxes_tot);
 
-            % checking collisions
+            % --- PASSATA 1: Cinematica (aggiorna posizioni) ----------------
+            for ii = 1:this.n_boxes_tot
+                [i_b, j_b] = getAMSIndex(this, this.x_boxes(ii), this.y_boxes(ii));
+                this.i_box(ii) = i_b;
+                this.j_box(ii) = j_b;
 
-            for ii=1:this.n_boxes_tot
-
-                if this.x_boxes(ii)-this.d_boxes(ii)/2<0
-                    this.x_boxes(ii) = this.d_boxes(ii)/2;
-                elseif this.x_boxes(ii)+this.d_boxes(ii)/2>l_AMS_matrix
-                    this.x_boxes(ii) = l_AMS_matrix-this.d_boxes(ii)/2;
-                end
-
-                % identifying on which AMS the boxes are (geometrical baricenter)
-
-                if this.y_boxes(ii)<=this.d_AMS
-                    this.i_box(ii) = 1;
-                elseif this.y_boxes(ii)<=this.d_AMS*2
-                    this.i_box(ii) = 2;
-                elseif this.y_boxes(ii)<=this.d_AMS*3
-                    this.i_box(ii) = 3;
-                elseif this.y_boxes(ii)<=this.d_AMS*4
-                    this.i_box(ii) = 4;
-                elseif this.y_boxes(ii)<=this.d_AMS*5
-                    this.i_box(ii) = 5;
+                if i_b < 6
+                    vx = v_AMS(i_b,j_b) * sin(rotation_AMS(i_b,j_b));
+                    vy = v_AMS(i_b,j_b) * cos(rotation_AMS(i_b,j_b));
                 else
-                    this.i_box(ii) = 6;
+                    % Pacco fuori griglia: tapis roulant solo in Y
+                    vx = 0;
+                    vy = this.v_treadmill;
                 end
 
-                if this.i_box(ii) == 6
-                    this.j_box(ii) = 6;
-                elseif this.x_boxes(ii)<=this.d_AMS
-                    this.j_box(ii) = 1;
-                elseif this.x_boxes(ii)<=this.d_AMS*2
-                    this.j_box(ii) = 2;
-                elseif this.x_boxes(ii)<=this.d_AMS*3
-                    this.j_box(ii) = 3;
-                elseif this.x_boxes(ii)<=this.d_AMS*4
-                    this.j_box(ii) = 4;
-                else
-                    this.j_box(ii) = 5;
-                end
+                this.vx_boxes(ii) = vx;
+                this.vy_boxes(ii) = vy;
 
-                % packages kinematics
+                this.x_boxes(ii) = this.x_boxes(ii) + vx * this.dt;
+                this.y_boxes(ii) = this.y_boxes(ii) + vy * this.dt;
+            end
 
-                if this.i_box(ii) < 6
-                    this.x_boxes(ii) = this.x_boxes(ii) + v_AMS(this.i_box(ii),this.j_box(ii))*this.dt*sin(rotation_AMS(this.i_box(ii),this.j_box(ii)));
-                    this.y_boxes(ii) = this.y_boxes(ii) + v_AMS(this.i_box(ii),this.j_box(ii))*this.dt*cos(rotation_AMS(this.i_box(ii),this.j_box(ii)));
-                    this.vy_boxes(ii) = v_AMS(this.i_box(ii),this.j_box(ii))*this.dt*cos(rotation_AMS(this.i_box(ii),this.j_box(ii)));
-                else
-                    this.x_boxes(ii) = this.x_boxes(ii);
-                    this.y_boxes(ii) = this.y_boxes(ii) + this.v_treadmill*this.dt;
-                    this.vy_boxes(ii) = this.v_treadmill;
-                end
+            % --- PASSATA 2: Risoluzione collisioni (MTV + restituzione) ----
+            this = risolviCollisioni(this);
 
-                % collisions
+            % --- Clamp bordi laterali DOPO la risoluzione collisioni -------
+            for ii = 1:this.n_boxes_tot
+                r = this.d_boxes(ii) / 2;
+                this.x_boxes(ii) = max(r, min(L - r, this.x_boxes(ii)));
+            end
 
-                if ii>1 && this.cont>1
-                    for jj=ii:-1:2
-                        if abs(this.x_boxes(ii)-this.x_boxes(jj-1)) <= this.d_boxes(ii)/2+this.d_boxes(jj-1)/2 + 0.001 ...
-                                && abs(this.x_boxes_vect(ii,this.cont-1)-this.x_boxes_vect(jj-1,this.cont-1)) >= this.d_boxes(ii)/2+this.d_boxes(jj-1)/2 ...
-                                && abs(this.y_boxes(ii)-this.y_boxes(jj-1)) <= this.d_boxes(ii)/2+this.d_boxes(jj-1)/2 ...
-                                && abs(this.y_boxes_vect(ii,this.cont-1)-this.y_boxes_vect(jj-1,this.cont-1)) <= this.d_boxes(ii)/2+this.d_boxes(jj-1)/2
-                            if (this.x_boxes(ii)-this.d_boxes(ii)/2 <= this.x_boxes(jj-1)+this.d_boxes(jj-1)/2 && this.x_boxes(ii)-this.d_boxes(ii)/2>this.x_boxes(jj-1)-this.d_boxes(jj-1)/2)
-                                penetrazione_x = (this.x_boxes(jj-1)+this.d_boxes(jj-1)/2) - (this.x_boxes(ii)-this.d_boxes(ii)/2);
-                                this.x_boxes(ii) = this.x_boxes(ii) + penetrazione_x/2 + this.toll_contatto;
-                                this.x_boxes(jj-1) = this.x_boxes(jj-1) - penetrazione_x/2 - this.toll_contatto;
-                            elseif (this.x_boxes(ii)+this.d_boxes(ii)/2 >= this.x_boxes(jj-1)-this.d_boxes(jj-1)/2 && this.x_boxes(ii)+this.d_boxes(ii)/2<this.x_boxes(jj-1)+this.d_boxes(jj-1)/2)
-                                penetrazione_x = (this.x_boxes(ii)+this.d_boxes(ii)/2) - (this.x_boxes(jj-1)-this.d_boxes(jj-1)/2);
-                                this.x_boxes(ii) = this.x_boxes(ii) - penetrazione_x/2 - this.toll_contatto;
-                                this.x_boxes(jj-1) = this.x_boxes(jj-1) + penetrazione_x/2 + this.toll_contatto;
-                            end
-                        elseif abs(this.y_boxes(ii)-this.y_boxes(jj-1)) <= this.d_boxes(ii)/2+this.d_boxes(jj-1)/2 + 0.001 ...
-                                && abs(this.y_boxes_vect(ii,this.cont-1)-this.y_boxes_vect(jj-1,this.cont-1)) >= this.d_boxes(ii)/2+this.d_boxes(jj-1)/2 ...
-                                && abs(this.x_boxes(ii)-this.x_boxes(jj-1)) <= this.d_boxes(ii)/2+this.d_boxes(jj-1)/2 ...
-                            if (this.y_boxes(ii)-this.d_boxes(ii)/2 <= this.y_boxes(jj-1)+this.d_boxes(jj-1)/2 && this.y_boxes(ii)-this.d_boxes(ii)/2>this.y_boxes(jj-1)-this.d_boxes(jj-1)/2) % || (this.y_boxes(jj-1)-this.d_boxes(jj-1)/2 <= this.y_boxes(ii)+this.d_boxes(ii)/2 && this.y_boxes(jj-1)-this.d_boxes(jj-1)/2>this.y_boxes(ii)-this.d_boxes(ii)/2)
-                                penetrazione_y = (this.y_boxes(jj-1)+this.d_boxes(jj-1)/2)-(this.y_boxes(ii)-this.d_boxes(ii)/2);
-                                this.y_boxes(ii) = this.y_boxes(ii) + penetrazione_y/2 + this.toll_contatto;
-                                this.y_boxes(jj-1) = this.y_boxes(jj-1) - penetrazione_y/2 - this.toll_contatto;
-                            elseif (this.y_boxes(ii)+this.d_boxes(ii)/2 < this.y_boxes(jj-1)+this.d_boxes(jj-1)/2 && this.y_boxes(ii)+this.d_boxes(ii)/2 >= this.y_boxes(jj-1)-this.d_boxes(jj-1)/2) % || (this.y_boxes(jj-1)+this.d_boxes(jj-1)/2 < this.y_boxes(ii)+this.d_boxes(ii)/2 && this.y_boxes(jj-1)+this.d_boxes(jj-1)/2 >= this.y_boxes(ii)-this.d_boxes(ii)/2)
-                                penetrazione_y = (this.y_boxes(ii)+this.d_boxes(ii)/2) - (this.y_boxes(jj-1)-this.d_boxes(jj-1)/2);
-                                this.y_boxes(ii) = this.y_boxes(ii) - penetrazione_y/2  - this.toll_contatto;
-                                this.y_boxes(jj-1) = this.y_boxes(jj-1) + penetrazione_y/2 + this.toll_contatto;
-                            end
-                        end
-                    end
-                end
-                
-                if this.i_box(ii)<6 && this.j_box(ii)<6
-                    act_AMS(this.j_box(ii)+(this.i_box(ii)-1)*5) = 1;
-                    this.index_AMS(ii) = this.j_box(ii)+(this.i_box(ii)-1)*5;
+            % --- Aggiorna indici AMS post-movimento -----------------------
+            for ii = 1:this.n_boxes_tot
+                [i_b, j_b] = getAMSIndex(this, this.x_boxes(ii), this.y_boxes(ii));
+                this.i_box(ii) = i_b;
+                this.j_box(ii) = j_b;
+                if i_b < 6 && j_b < 6
+                    this.index_AMS(ii) = j_b + (i_b-1)*5;
                 else
                     this.index_AMS(ii) = 0;
                 end
             end
 
-            % Observation: observations for the RL to be defined
-            % Costruiamo il vettore delle osservazioni (50 elementi)
-            % Ordine: [x_att, y_att, x_prec, y_prec, diametro] x 10 pacchi
-            Observation = [this.x_boxes;       ... % 1-10: X attuali
-                this.y_boxes;   ... % 11-20: Y attuali
-                this.x_boxes_prec;  ... % 21-30: X precedenti
-                this.y_boxes_prec;  ... % 31-40: Y precedenti
-                this.d_boxes];          % 41-50: Diametri
+            % --- Costruzione osservazione ----------------------------------
+            Observation = buildObservation(this);
+            this.State  = Observation;
 
-            for ii=1:this.max_gen_boxes
-                if ii<=this.n_boxes_tot
-                    this.x_boxes_vect(ii,this.cont) = this.x_boxes(ii);
-                    this.y_boxes_vect(ii,this.cont) = this.y_boxes(ii);
-                    this.x_boxes_prec(ii) = this.x_boxes(ii);
-                    this.y_boxes_prec(ii) = this.y_boxes(ii);
-                else
-                    this.x_boxes_vect(ii,this.cont) = -1;
-                    this.y_boxes_vect(ii,this.cont) = -1;
+            % --- Verifica uscite -------------------------------------------
+            this.index_exit_prev = this.index_exit;
+            for ii = 1:this.n_boxes_tot
+                if this.y_boxes(ii) > this.d_AMS*5 && this.pack_exited(ii) == 0
+                    this.pack_exited(ii) = 1;
+                    this.index_exit = this.index_exit + 1;
+                    this.exit_order(this.index_exit) = ii;
                 end
             end
 
-            % Update system states
-            this.State = Observation;
-
-            cont_exit = 0;
-
-            % Check terminal condition
-            for ii=1:this.n_boxes_tot
-                if this.y_boxes(ii)>this.d_AMS*5
-                    cont_exit = cont_exit + 1;
-                    if this.pack_exited(ii) == 0
-                        this.pack_exited(ii) = 1;
-                        this.index_exit = this.index_exit + 1;
-                        this.exit_order(this.index_exit) = ii;
-                    end
-                end
-            end
-
-            if cont_exit==this.max_gen_boxes
-                IsDone = true;
-            else
-                IsDone = false;
-            end
-
+            % --- Condizione terminale: tutti i pacchi sono usciti ---------
+            IsDone = (sum(this.pack_exited(1:this.n_boxes_tot)) == this.max_gen_boxes);
             this.IsDone = IsDone;
-            
-            % Get reward
-            Reward = getReward(this,AMS_actions);
-            
-            %% OPTIONAL
-            % (optional) use notifyEnvUpdated to signal that the 
-            % environment has been updated (e.g. to update visualization)
+
+            % --- Reward ---------------------------------------------------
+            Reward = getReward(this, AMS_actions);
+
             notifyEnvUpdated(this);
         end
-        
-        % Reset environment to initial state and output initial observation
-        % for each episod
+
+        % -----------------------------------------------------------------
+        % Reset
+        % -----------------------------------------------------------------
         function InitialObservation = reset(this)
-
-            this.index_exit = 0;
-            this.pack_exited = zeros(10,1); % is package exited the AMS or not?
-            this.exit_order = zeros(10,1); % packages ordered by exit
-
-            this.cont_new_box = 1;
-
+            this.index_exit      = 0;
+            this.index_exit_prev = 0;
+            this.pack_exited     = zeros(10,1);
+            this.exit_order      = zeros(10,1);
+            this.cont_new_box    = 1;
             this.n_boxes_tot_vect = 2;
-            this.n_boxes_tot = this.n_boxes_tot_vect;
-
+            this.n_boxes_tot     = 2;
             this.time = 0;
-
-            this.vy_boxes = zeros(2,1);
-
             this.cont = 0;
 
-            max_d_box = 2.*this.d_AMS; % m
-            min_d_box = 0.25*this.d_AMS; % m
+            L         = this.d_AMS * this.n_j_AMS;
+            max_d_box = 2.0  * this.d_AMS;
+            min_d_box = 0.25 * this.d_AMS;
 
-            l_AMS_matrix = this.d_AMS*this.n_j_AMS; % m
-
-            % generating initial boxes (2)
-            for ii=1:this.max_gen_boxes
-                this.d_boxes(ii) = min_d_box + (max_d_box-min_d_box)*rand(1);
+            % Genera diametri per tutti i possibili pacchi
+            for ii = 1:this.max_gen_boxes
+                this.d_boxes(ii) = min_d_box + (max_d_box - min_d_box)*rand(1);
             end
 
-            for ii=1:2
-                if ii == 1
-                    x1 = this.d_boxes(1)*0.5 + (this.d_AMS*2.5-this.d_boxes(1)*0.5)*rand(1);
-                else
-                    x2 = this.d_AMS*2.5+this.d_boxes(2)*0.5 + (l_AMS_matrix-(this.d_AMS*2.5+this.d_boxes(2)*0.5))*rand(1);
-                    if abs(x2-x1) <= this.d_boxes(this.n_boxes_tot)/2+this.d_boxes(this.n_boxes_tot-1)/2
-                        x2 = x1 + this.d_boxes(2)/2 + this.d_boxes(1)/2 + 0.1;
-                    end
-                    if x2-this.d_boxes(2)/2<0
-                        x2 = this.d_boxes(2)/2;
-                    elseif x2+this.d_boxes(2)/2>l_AMS_matrix
-                        x2 = l_AMS_matrix-this.d_boxes(2)/2;
-                    end
-                    if abs(x2-x1) <= this.d_boxes(2)/2+this.d_boxes(1)/2
-                        x1 = x2 - (this.d_boxes(2)/2 + this.d_boxes(1)/2 + 0.1);
-                    end
-                end
+            % Posiziona i 2 pacchi iniziali (metà sinistra e metà destra)
+            x1 = this.d_boxes(1)*0.5 + (this.d_AMS*2.5 - this.d_boxes(1)*0.5)*rand(1);
+            x2 = this.d_AMS*2.5 + this.d_boxes(2)*0.5 + ...
+                 (L - (this.d_AMS*2.5 + this.d_boxes(2)*0.5))*rand(1);
 
-                y1 = 0.001 + rand(1)*0.01;
-                y2 = 0.001 + rand(1)*0.05;
+            % Risolvi eventuale sovrapposizione iniziale
+            gap_min = this.d_boxes(1)/2 + this.d_boxes(2)/2 + this.toll_contatto;
+            if abs(x2-x1) < gap_min
+                x2 = x1 + gap_min + 0.05;
+            end
+            x2 = max(this.d_boxes(2)/2, min(L - this.d_boxes(2)/2, x2));
+            if abs(x2-x1) < gap_min
+                x1 = x2 - gap_min - 0.05;
             end
 
-            this.x_boxes(1) = x1;
-            this.y_boxes(1) = y1;
-            this.x_boxes(2) = x2;
-            this.y_boxes(2) = y2;
+            y1 = 0.001 + rand(1)*0.01;
+            y2 = 0.001 + rand(1)*0.05;
 
-            this.x_boxes_prec(1) = x1;
-            this.x_boxes_prec(2) = x2;
-            this.y_boxes_prec(1) = y1;
-            this.y_boxes_prec(2) = y2;
+            this.x_boxes(1) = x1;  this.y_boxes(1) = y1;
+            this.x_boxes(2) = x2;  this.y_boxes(2) = y2;
 
-            for ii=this.n_boxes_tot+1:this.max_gen_boxes
-                this.x_boxes(ii) = 0;
-                this.y_boxes(ii) = 0;
+            this.x_boxes_prec(1) = x1; this.y_boxes_prec(1) = y1;
+            this.x_boxes_prec(2) = x2; this.y_boxes_prec(2) = y2;
+
+            this.vx_boxes = zeros(10,1);
+            this.vy_boxes = zeros(10,1);
+
+            % Pacchi non ancora generati → sentinella
+            for ii = 3:this.max_gen_boxes
+                this.x_boxes(ii) = -1;
+                this.y_boxes(ii) = -1;
+                this.x_boxes_prec(ii) = -1;
+                this.y_boxes_prec(ii) = -1;
             end
 
-            act_AMS = zeros(25,1);
-            this.index_AMS = zeros(2,1);
-
-            % identifying on which AMS the boxes are (geometrical
-            % baricenter)
-
-            for ii=1:this.n_boxes_tot
-
-                if this.y_boxes(ii)<=this.d_AMS
-                    this.i_box(ii) = 1;
-                elseif this.y_boxes(ii)<=this.d_AMS*2
-                    this.i_box(ii) = 2;
-                elseif this.y_boxes(ii)<=this.d_AMS*3
-                    this.i_box(ii) = 3;
-                elseif this.y_boxes(ii)<=this.d_AMS*4
-                    this.i_box(ii) = 4;
-                elseif this.y_boxes(ii)<=this.d_AMS*5
-                    this.i_box(ii) = 5;
-                else
-                    this.i_box(ii) = 6;
+            % Calcola indici AMS iniziali
+            this.index_AMS = zeros(10,1);
+            for ii = 1:this.n_boxes_tot
+                [i_b, j_b] = getAMSIndex(this, this.x_boxes(ii), this.y_boxes(ii));
+                this.i_box(ii) = i_b;
+                this.j_box(ii) = j_b;
+                if i_b < 6 && j_b < 6
+                    this.index_AMS(ii) = j_b + (i_b-1)*5;
                 end
-
-                if this.i_box(ii) == 6
-                    this.j_box(ii) = 6;
-                elseif this.x_boxes(ii)<=this.d_AMS
-                    this.j_box(ii) = 1;
-                elseif this.x_boxes(ii)<=this.d_AMS*2
-                    this.j_box(ii) = 2;
-                elseif this.x_boxes(ii)<=this.d_AMS*3
-                    this.j_box(ii) = 3;
-                elseif this.x_boxes(ii)<=this.d_AMS*4
-                    this.j_box(ii) = 4;
-                else
-                    this.j_box(ii) = 5;
-                end
-
-                if this.i_box(ii)<6 && this.j_box(ii)<6
-                    act_AMS(this.j_box(ii)+(this.i_box(ii)-1)*5) = 1;
-                    this.index_AMS(ii) = this.j_box(ii)+(this.i_box(ii)-1)*5;
-                else
-                    this.index_AMS(ii) = 0;
-                end
-
             end
 
-            % InitialObservation: initial observation for the RL to be
-            % defined
-            % Costruiamo il vettore delle osservazioni iniziali (50 elementi)
-            % Deve seguire lo stesso ordine logico usato nel metodo step
-            InitialObservation = [this.x_boxes(:);       ... % 1-10: X iniziali
-                this.y_boxes(:);       ... % 11-20: Y iniziali
-                this.x_boxes_prec(:);  ... % 21-30: X precedenti (uguali alle attuali al reset)
-                this.y_boxes_prec(:);  ... % 31-40: Y precedenti (uguali alle attuali al reset)
-                this.d_boxes(:)];          % 41-50: Diametri dei pacchi
+            InitialObservation = buildObservation(this);
             this.State = InitialObservation;
-            
-            %% OPTIONAL
-            % (optional) use notifyEnvUpdated to signal that the 
-            % environment has been updated (e.g. to update visualization)
+
             notifyEnvUpdated(this);
-
         end
-    end
 
+    end % methods (necessari)
 
-    %% Optional Methods (set methods' attributes accordingly)
-    methods  
+    %% =====================================================================
+    %  Metodi opzionali pubblici
+    %% =====================================================================
+    methods
 
         function varargout = plot(this)
             if isempty(this.Visualizer) || ~isvalid(this.Visualizer)
@@ -505,58 +327,292 @@ classdef RL_environment1 < rl.env.MATLABEnvironment
             else
                 bringToFront(this.Visualizer);
             end
-            if nargout
-                varargout{1} = this.Visualizer;
-            end
-            % Reset Visualizations
+            if nargout, varargout{1} = this.Visualizer; end
             this.VisualizeAnimation = true;
-            this.VisualizeActions = false;
-            this.VisualizeStates = false;
+            this.VisualizeActions   = false;
+            this.VisualizeStates    = false;
         end
 
-        % Reward function
-        function Reward = getReward(this, AMS_actions)
-            % 1. Inizializzazione
+        % -----------------------------------------------------------------
+        % Reward function migliorata
+        % -----------------------------------------------------------------
+        function Reward = getReward(this, ~)
             Reward = 0;
-    
-            % 2. Penalità collisioni (usa il loop scritto sopra)
-            penalty_collision = 0;
+
+            % ----------------------------------------------------------
+            % 1. PENALITÀ COLLISIONE proporzionale alla penetrazione
+            %    Più i pacchi si sovrappongono, più la penalità è alta.
+            %    Questo gradiente aiuta la rete a imparare ad evitare la
+            %    compenetrazione, non solo a non toccarsi.
+            % ----------------------------------------------------------
             for ii = 1:this.n_boxes_tot
-                for jj = ii+1:this.n_boxes_tot
-                    dist = sqrt((this.x_boxes(ii)-this.x_boxes(jj))^2 + (this.y_boxes(ii)-this.y_boxes(jj))^2);
-                    if dist < (this.d_boxes(ii) + this.d_boxes(jj))/2 + this.toll_contatto
-                        penalty_collision = penalty_collision - 100; % Penalità pesante
+                for jj = ii+1 : this.n_boxes_tot
+                    if this.x_boxes(ii) < 0 || this.x_boxes(jj) < 0
+                        continue   % pacco non ancora generato (sentinella)
+                    end
+                    dx   = this.x_boxes(ii) - this.x_boxes(jj);
+                    dy   = this.y_boxes(ii) - this.y_boxes(jj);
+                    dist = sqrt(dx^2 + dy^2);
+                    min_dist = (this.d_boxes(ii) + this.d_boxes(jj)) / 2;
+                    if dist < min_dist
+                        penetrazione = min_dist - dist;          % [0, min_dist]
+                        % Penalità scalata: -50 per leggero contatto,
+                        % fino a -200 per sovrapposizione profonda
+                        Reward = Reward - 50 * (1 + 3*(penetrazione/min_dist));
                     end
                 end
             end
-            Reward = Reward + penalty_collision;
-            % 3. Premio per uscita pacchi (singulation)
-            % Se un pacco è appena uscito, dai un premio
-            Reward = Reward + (this.index_exit * 10); 
 
-            % 4. Penalità per eccessivo stazionamento
-            Reward = Reward - 0.5; 
-    
-            % 5. (Opzionale) Penalità se i pacchi escono troppo vicini
-            % Puoi usare this.exit_order per vedere quali sono usciti per ultimi
+            % ----------------------------------------------------------
+            % 2. PREMIO USCITA (delta): reward solo allo step in cui un
+            %    pacco esce, non ad ogni step successivo.
+            %    Senza delta, la reward cresceva indefinitamente e
+            %    mascherava i segnali negativi delle collisioni.
+            % ----------------------------------------------------------
+            n_nuovi_usciti = this.index_exit - this.index_exit_prev;
+            Reward = Reward + n_nuovi_usciti * 150;
+
+            % ----------------------------------------------------------
+            % 3. PREMIO SINGOLAZIONE all'uscita
+            %    Quando due pacchi escono in momenti diversi e con un gap
+            %    laterale sufficiente, viene dato un bonus. Questo incentiva
+            %    la separazione spaziale (singolazione), obiettivo reale di
+            %    un sistema AMS.
+
+            %   NO (?) VOGLIAMO PREMIARE IL GAP VERTICALE
+            % ----------------------------------------------------------
+            if this.index_exit >= 2
+                for kk = max(1, this.index_exit_prev+1) : this.index_exit
+                    idx_uscito = this.exit_order(kk);
+                    for mm = 1:kk-1
+                        idx_prec = this.exit_order(mm);
+                        if idx_uscito > 0 && idx_prec > 0
+                            sep_x = abs(this.x_boxes(idx_uscito) - this.x_boxes(idx_prec));
+                            soglia_sep = (this.d_boxes(idx_uscito) + this.d_boxes(idx_prec));
+                            if sep_x > soglia_sep
+                                Reward = Reward + 80;   % ben separati lateralmente
+                            elseif sep_x > soglia_sep * 0.5
+                                Reward = Reward + 20;   % parzialmente separati
+                            end
+                        end
+                    end
+                end
+            end
+
+            % ----------------------------------------------------------
+            % 4. PREMIO THROUGHPUT (shaping continuo)
+            %    Incentiva i pacchi a muoversi verso l'uscita (Y crescente)
+            %    calcolando il progresso medio Y dei pacchi ancora in griglia.
+            %    Scala il contributo per non dominare sulla singolazione.
+            % ----------------------------------------------------------
+            n_in_griglia = 0;
+            progresso_y  = 0;
+            for ii = 1:this.n_boxes_tot
+                if this.pack_exited(ii) == 0 && this.x_boxes(ii) >= 0
+                    dy_step = this.y_boxes(ii) - this.y_boxes_prec(ii);
+                    progresso_y = progresso_y + max(0, dy_step);
+                    n_in_griglia = n_in_griglia + 1;
+                end
+            end
+            if n_in_griglia > 0
+                Reward = Reward + 10 * (progresso_y / n_in_griglia) / this.dt;
+            end
+
+            % ----------------------------------------------------------
+            % 5. PENALITÀ STAZIONAMENTO (invariata)
+            %    Piccolo costo fisso per step per disincentivare inerzia.
+            % ----------------------------------------------------------
+            Reward = Reward - 0.5;
         end
-        
-        %% OPTIONAL
-        % (optional) Properties validation through set methods
-        function set.State(this,state)
-            validateattributes(state,{'numeric'},{'finite','real','vector','numel',50},'','State');
+
+        % -----------------------------------------------------------------
+        % Set State (validazione)
+        % -----------------------------------------------------------------
+        function set.State(this, state)
+            validateattributes(state, {'numeric'}, ...
+                {'finite','real','vector','numel',50}, '', 'State');
             this.State = double(state(:));
             notifyEnvUpdated(this);
         end
-        
-    end
-    
+
+    end % methods (opzionali pubblici)
+
+    %% =====================================================================
+    %  Metodi privati (helper)
+    %% =====================================================================
+    methods (Access = private)
+
+        % -----------------------------------------------------------------
+        % Costruisce il vettore osservazione normalizzato [0,1]
+        % -----------------------------------------------------------------
+        function obs = buildObservation(this)
+            L = this.d_AMS * this.n_j_AMS;
+            H = this.d_AMS * this.n_i_AMS;
+            obs = [ this.x_boxes / L;           ... % 1-10:  X norm
+                    this.y_boxes / H;           ... % 11-20: Y norm
+                    this.x_boxes_prec / L;      ... % 21-30: X_prec norm
+                    this.y_boxes_prec / H;      ... % 31-40: Y_prec norm
+                    this.d_boxes / (2*this.d_AMS) ]; % 41-50: diam norm
+        end
+
+        % -----------------------------------------------------------------
+        % Restituisce la cella AMS (i,j) dato (x,y).
+        % i=6 o j=6 significa fuori dalla griglia.
+        % -----------------------------------------------------------------
+        function [i_b, j_b] = getAMSIndex(this, x, y)
+            d = this.d_AMS;
+            if     y <= d,   i_b = 1;
+            elseif y <= 2*d, i_b = 2;
+            elseif y <= 3*d, i_b = 3;
+            elseif y <= 4*d, i_b = 4;
+            elseif y <= 5*d, i_b = 5;
+            else,            i_b = 6;
+            end
+
+            if i_b == 6
+                j_b = 6;
+                return
+            end
+
+            if     x <= d,   j_b = 1;
+            elseif x <= 2*d, j_b = 2;
+            elseif x <= 3*d, j_b = 3;
+            elseif x <= 4*d, j_b = 4;
+            else,            j_b = 5;
+            end
+        end
+
+        % -----------------------------------------------------------------
+        % Generazione pacchi durante la simulazione
+        % -----------------------------------------------------------------
+        function this = generaPacki(this, L)
+            this.cont_new_box = this.cont_new_box + 1;
+
+            gen_n = min(2, this.max_gen_boxes - this.n_boxes_tot);
+            if gen_n <= 0, return; end
+
+            this.n_boxes_tot = this.n_boxes_tot + gen_n;
+            this.n_boxes_tot_vect(this.cont_new_box) = gen_n;
+
+            if gen_n >= 2
+                % Pacco sinistro
+                idx1 = this.n_boxes_tot - 1;
+                this.x_boxes(idx1) = this.d_boxes(idx1)*0.5 + ...
+                    (this.d_AMS*2.5 - this.d_boxes(idx1)*0.5)*rand(1);
+                this.y_boxes(idx1) = 0.001 + rand(1)*0.01;
+
+                % Pacco destro
+                idx2 = this.n_boxes_tot;
+                this.x_boxes(idx2) = this.d_AMS*2.5 + this.d_boxes(idx2)*0.5 + ...
+                    (L - (this.d_AMS*2.5 + this.d_boxes(idx2)*0.5))*rand(1);
+                this.y_boxes(idx2) = 0.001 + rand(1)*0.05;
+
+                % Garantisci separazione minima tra i due nuovi pacchi
+                gap_min = this.d_boxes(idx1)/2 + this.d_boxes(idx2)/2 + this.toll_contatto;
+                if abs(this.x_boxes(idx2) - this.x_boxes(idx1)) < gap_min
+                    this.x_boxes(idx2) = this.x_boxes(idx1) + gap_min + 0.05;
+                end
+                this.x_boxes(idx2) = max(this.d_boxes(idx2)/2, ...
+                    min(L - this.d_boxes(idx2)/2, this.x_boxes(idx2)));
+                if abs(this.x_boxes(idx2) - this.x_boxes(idx1)) < gap_min
+                    this.x_boxes(idx1) = this.x_boxes(idx2) - gap_min - 0.05;
+                end
+
+                this.x_boxes_prec(idx1) = this.x_boxes(idx1);
+                this.y_boxes_prec(idx1) = this.y_boxes(idx1);
+                this.x_boxes_prec(idx2) = this.x_boxes(idx2);
+                this.y_boxes_prec(idx2) = this.y_boxes(idx2);
+            else
+                idx = this.n_boxes_tot;
+                this.x_boxes(idx) = this.d_boxes(idx)*0.55 + ...
+                    (L - this.d_boxes(idx)*0.55)*rand(1);
+                this.y_boxes(idx) = 0.001 + rand(1)*0.01;
+                this.x_boxes_prec(idx) = this.x_boxes(idx);
+                this.y_boxes_prec(idx) = this.y_boxes(idx);
+            end
+        end
+
+        % -----------------------------------------------------------------
+        % Risoluzione collisioni con MTV (Minimum Translation Vector)
+        %
+        % Tratta ogni pacco come un disco di diametro d_boxes(ii).
+        % Per ogni coppia (ii,jj) in collisione:
+        %   1. Calcola il vettore normale n = (xi-xj)/dist
+        %   2. Sposta i due centri lungo n di penetrazione/2 ciascuno
+        %   3. Applica impulso di velocità lungo n (rispettando
+        %      il coefficiente di restituzione)
+        %
+        % Il ciclo viene ripetuto fino a MAX_ITER volte per gestire
+        % collisioni multiple simultanee (catena di pacchi).
+        % -----------------------------------------------------------------
+        function this = risolviCollisioni(this)
+            MAX_ITER = 5;   % iterazioni massime di risoluzione per step
+
+            for iter = 1:MAX_ITER
+                collisione_trovata = false;
+
+                for ii = 1:this.n_boxes_tot
+                    if this.x_boxes(ii) < 0, continue; end   % sentinella
+
+                    for jj = ii+1 : this.n_boxes_tot
+                        if this.x_boxes(jj) < 0, continue; end
+
+                        dx = this.x_boxes(ii) - this.x_boxes(jj);
+                        dy = this.y_boxes(ii) - this.y_boxes(jj);
+                        dist = sqrt(dx^2 + dy^2);
+                        min_dist = (this.d_boxes(ii) + this.d_boxes(jj))/2;
+
+                        if dist < min_dist && dist > 1e-9
+                            collisione_trovata = true;
+
+                            % --- Normale al contatto (da jj verso ii) ---
+                            nx = dx / dist;
+                            ny = dy / dist;
+
+                            % --- Correzione posizione (MTV simmetrico) ---
+                            penetrazione = min_dist - dist + this.toll_contatto;
+                            this.x_boxes(ii) = this.x_boxes(ii) + nx * penetrazione/2;
+                            this.y_boxes(ii) = this.y_boxes(ii) + ny * penetrazione/2;
+                            this.x_boxes(jj) = this.x_boxes(jj) - nx * penetrazione/2;
+                            this.y_boxes(jj) = this.y_boxes(jj) - ny * penetrazione/2;
+
+                            % --- Correzione velocità (impulso 1D lungo n) ---
+                            % Velocità relative lungo la normale
+                            dvx = this.vx_boxes(ii) - this.vx_boxes(jj);
+                            dvy = this.vy_boxes(ii) - this.vy_boxes(jj);
+                            vrel_n = dvx*nx + dvy*ny;
+
+                            % Applica impulso solo se i pacchi si avvicinano
+                            if vrel_n < 0
+                                % Massa unitaria → impulso simmetrico
+                                j_imp = -(1 + this.coeff_restituzione) * vrel_n / 2;
+                                this.vx_boxes(ii) = this.vx_boxes(ii) + j_imp*nx;
+                                this.vy_boxes(ii) = this.vy_boxes(ii) + j_imp*ny;
+                                this.vx_boxes(jj) = this.vx_boxes(jj) - j_imp*nx;
+                                this.vy_boxes(jj) = this.vy_boxes(jj) - j_imp*ny;
+                            end
+                        end
+                    end
+                end
+
+                if ~collisione_trovata, break; end
+            end
+        end
+
+    end % methods (Access = private)
+
+    %% =====================================================================
+    %  Callback visualizzazione (opzionale)
+    %% =====================================================================
     methods (Access = protected)
-        %% OPTIONAL
-        % (optional) update visualization everytime the environment is updated 
-        % (notifyEnvUpdated is called)
-        function envUpdatedCallback(this)
-            disp(['Dimensione stato attuale: ', num2cell(numel(this.State))]);
+        function envUpdatedCallback(this) %#ok<MANU>
+            % Lasciato intenzionalmente vuoto:
+            % la diagnostica disp() ad ogni step rallenta enormemente il
+            % training. Decommentare solo per debug locale.
+            % disp(['Step: ', num2str(this.cont), ...
+            %        '  Pacchi: ', num2str(this.n_boxes_tot), ...
+            %        '  Usciti: ', num2str(this.index_exit)]);
         end
     end
+
 end

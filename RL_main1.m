@@ -9,7 +9,7 @@ clc
 
 env=RL_environment1();
 
-doTraining = true;
+doTraining = false;
 
 if doTraining == true
 

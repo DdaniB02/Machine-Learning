@@ -77,8 +77,9 @@ classdef RL_environment < rl.env.MATLABEnvironment
         d_boxes       = zeros(10,1);
         x_boxes       = zeros(10,1);
         y_boxes       = zeros(10,1);
-        x_boxes_vect  = zeros(10000,10);
-        y_boxes_vect  = zeros(10000,10);
+        buf_size      = 5000;               % [FIX] buffer circolare – memoria fissa
+        x_boxes_vect  = zeros(10,5000);    % [FIX] (pacchi x slot), era (10000x10) INVERTITO
+        y_boxes_vect  = zeros(10,5000);    % [FIX] idem
         cont          = 0;
 
         pack_exited   = zeros(10,1);
@@ -275,7 +276,7 @@ classdef RL_environment < rl.env.MATLABEnvironment
 
                 % Pairwise collision resolution
                 if ii > 1 && this.cont > 1
-                    ct = this.cont - 1;
+                    ct = mod(this.cont - 2, this.buf_size) + 1;   % [FIX] indice circolare t-1
                     for jj = ii:-1:2
                         if this.x_boxes(jj-1) < 0, continue; end
                         rsum = this.d_boxes(ii)/2 + this.d_boxes(jj-1)/2;
@@ -309,33 +310,36 @@ classdef RL_environment < rl.env.MATLABEnvironment
                 end
             end
 
-            % Trajectory history
+            % Trajectory history – buffer circolare, slot = mod(cont-1, buf_size)+1
+            slot = mod(this.cont - 1, this.buf_size) + 1;   % [FIX] sovrascrive slot ciclicamente
             for ii = 1:this.max_gen_boxes
                 if ii <= this.n_boxes_tot
-                    this.x_boxes_vect(ii, this.cont) = this.x_boxes(ii);
-                    this.y_boxes_vect(ii, this.cont) = this.y_boxes(ii);
+                    this.x_boxes_vect(ii, slot) = this.x_boxes(ii);
+                    this.y_boxes_vect(ii, slot) = this.y_boxes(ii);
                     this.x_boxes_prec(ii) = this.x_boxes(ii);
                     this.y_boxes_prec(ii) = this.y_boxes(ii);
                 else
-                    this.x_boxes_vect(ii, this.cont) = -1;
-                    this.y_boxes_vect(ii, this.cont) = -1;
+                    this.x_boxes_vect(ii, slot) = -1;
+                    this.y_boxes_vect(ii, slot) = -1;
                 end
             end
 
-            % Terminal condition
-            cont_exit = 0;
+            % Terminal condition: tutti i pacchi previsti sono usciti
+            % [FIX] Usare pack_exited (flag persistente) invece di contare
+            %        y > y_exit al passo corrente. L'indice cont_exit basato
+            %        su y_boxes conta lo stesso pacco ad ogni step dopo l'uscita,
+            %        causando IsDone=true prematuro non appena n_boxes_tot==
+            %        numero di pacchi ancora sulla superficie con y>y_exit.
             for ii = 1:this.n_boxes_tot
-                if this.y_boxes(ii) > y_exit
-                    cont_exit = cont_exit + 1;
-                    if this.pack_exited(ii) == 0
-                        this.pack_exited(ii) = 1;
-                        this.index_exit = this.index_exit + 1;
-                        this.exit_order(this.index_exit) = ii;
-                    end
+                if this.y_boxes(ii) > y_exit && this.pack_exited(ii) == 0
+                    this.pack_exited(ii) = 1;
+                    this.index_exit = this.index_exit + 1;
+                    this.exit_order(this.index_exit) = ii;
                 end
             end
 
-            IsDone      = (cont_exit == this.max_gen_boxes);
+            IsDone = (sum(this.pack_exited(1:this.max_gen_boxes)) == this.max_gen_boxes) && ...
+                     (this.n_boxes_tot == this.max_gen_boxes);
             this.IsDone = IsDone;
 
             Observation = buildObservation(this);
@@ -362,8 +366,8 @@ classdef RL_environment < rl.env.MATLABEnvironment
             this.n_collisions      = 0;
             this.vy_boxes          = zeros(this.max_gen_boxes, 1);
             this.prev_y_boxes      = zeros(10,1);
-            this.x_boxes_vect      = zeros(10000, 10);
-            this.y_boxes_vect      = zeros(10000, 10);
+            this.x_boxes_vect      = zeros(10, this.buf_size);   % [FIX] buffer circolare
+            this.y_boxes_vect      = zeros(10, this.buf_size);   % [FIX] buffer circolare
 
             l_AMS = this.d_AMS * this.n_j_AMS;
             max_d = 2.0 * this.d_AMS;
@@ -415,10 +419,10 @@ classdef RL_environment < rl.env.MATLABEnvironment
                 end
             end
 
-            % Seed history
+            % Seed history (slot 1 = passo 0, prima di qualsiasi step)
             for ii = 1:this.n_boxes_tot
-                this.x_boxes_vect(1, ii) = this.x_boxes(ii);
-                this.y_boxes_vect(1, ii) = this.y_boxes(ii);
+                this.x_boxes_vect(ii, 1) = this.x_boxes(ii);
+                this.y_boxes_vect(ii, 1) = this.y_boxes(ii);
             end
 
             InitialObservation = buildObservation(this);
@@ -572,8 +576,9 @@ classdef RL_environment < rl.env.MATLABEnvironment
 
                 ct = this.cont;
                 if ct > 1
-                    vx_r = (this.x_boxes(k) - this.x_boxes_vect(k, ct-1)) / this.dt;
-                    vy_r = (this.y_boxes(k) - this.y_boxes_vect(k, ct-1)) / this.dt;
+                    ct_prev = mod(ct - 2, this.buf_size) + 1;   % [FIX] indice circolare t-1
+                    vx_r = (this.x_boxes(k) - this.x_boxes_vect(k, ct_prev)) / this.dt;
+                    vy_r = (this.y_boxes(k) - this.y_boxes_vect(k, ct_prev)) / this.dt;
                 else
                     vx_r = 0;  vy_r = 0;
                 end
