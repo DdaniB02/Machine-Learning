@@ -63,12 +63,64 @@ classdef RL_environment1 < rl.env.MATLABEnvironment
         exit_order   = zeros(10,1);  % ordine di uscita
         index_exit   = 0;            % quanti pacchi sono usciti finora
         index_exit_prev = 0;         % valore al passo precedente (per delta reward)
+        y_exit       = zeros(10,1);  % posizione Y congelata al momento dell'uscita
+
+        % --- Curriculum learning ---
+        % La difficoltà aumenta progressivamente: all'inizio i diametri sono
+        % uniformi e le posizioni meno casuali, poi aumenta la varianza.
+        % curriculum_level: 0.0 (facile) → 1.0 (difficoltà piena)
+        curriculum_level = 0.0;      % aggiornato da RL_main dopo ogni episodio
+        curriculum_step  = 0.002;    % incremento per episodio
 
         % --- Parametri collisione ---
-        toll_contatto = 0.002;       % m  gap minimo di separazione post-risoluzione
-        % Coefficiente di restituzione: 0 = completamente anelastico
-        % (pacchi si separano senza rimbalzo), 1 = elastico
-        coeff_restituzione = 0.1;
+        toll_contatto      = 0.002;  % m  gap minimo di separazione post-risoluzione
+        coeff_restituzione = 0.1;    % 0=anelastico (cartone), 1=elastico
+
+        % ---------------------------------------------------------------
+        % PESI REWARD — modifica qui per cambiare il comportamento
+        % ---------------------------------------------------------------
+        % 1. Penalità collisione base (moltiplicata per la penetrazione)
+        %    Valore negativo. Es: -50 → penalità lieve, -200 → molto severa.
+        rw_collisione_base   = -50;
+
+        % 2. Premio uscita pacco (dato una sola volta per pacco)
+        %    Valore positivo. Es: 150 → obiettivo principale dell'agente.
+        rw_uscita            = 150;
+
+        % 3a. Premio singolazione: pacchi ben separati verticalmente
+        %     (gap Y > somma diametri)
+        rw_singolazione_ok   = 80;
+
+        % 3b. Premio singolazione parziale (gap Y > metà somma diametri)
+        rw_singolazione_parz = 20;
+
+        % 4. Shaping progressivo per riga AMS (moltiplicato per la riga 1-5)
+        %    Es: 0.5 → riga 1 dà +0.5/step, riga 5 dà +2.5/step
+        rw_shaping_riga      = 0.5;
+
+        % 5. Premio throughput (moltiplicato per velocità media Y normalizzata)
+        %    Es: 8 → incentiva avanzamento rapido verso l'uscita
+        rw_throughput        = 8;
+
+        % 6. Penalità stazionamento (costo fisso per ogni step)
+        %    Valore negativo. Es: -0.5 → piccola spinta a non restare fermi
+        rw_stazionamento     = -0.5;
+
+        % 7. Premio allineamento in fila indiana (dato ogni step per coppia)
+        %    Condizioni simultanee richieste:
+        %      a) pacchi separati verticalmente: |dy| > r_i + r_j  (non si toccano)
+        %      b) pacchi allineati lateralmente: |dx| < soglia_x    (stessa corsia)
+        %      c) entrambi ancora in griglia (non usciti)
+        %    Tenere piccolo rispetto a rw_uscita per evitare reward hacking
+        %    (agente che tiene i pacchi fermi e allineati senza farli avanzare).
+        %    Es: 10 → per 2 pacchi allineati per 100 step = +2000,
+        %        contro rw_uscita=150 × 10 pacchi = +1500 → attenzione al bilanciamento
+        rw_allineamento      = 4;
+
+        % Soglia laterale per considerare due pacchi "sulla stessa corsia".
+        % Espressa come multiplo della somma dei raggi: 1.0 = devono stare
+        % entro un diametro medio di distanza X, 2.0 = più permissivo.
+        rw_allineamento_soglia_x = 1.5;
 
         % --- Tempo ---
         dt   = 0.01;                 % s  timestep
@@ -226,6 +278,9 @@ classdef RL_environment1 < rl.env.MATLABEnvironment
                     this.pack_exited(ii) = 1;
                     this.index_exit = this.index_exit + 1;
                     this.exit_order(this.index_exit) = ii;
+                    % Congela la Y al momento dell'uscita: usata nella reward
+                    % di singolazione per evitare che sep_y cresca ad ogni step
+                    this.y_exit(ii) = this.y_boxes(ii);
                 end
             end
 
@@ -247,6 +302,10 @@ classdef RL_environment1 < rl.env.MATLABEnvironment
             this.index_exit_prev = 0;
             this.pack_exited     = zeros(10,1);
             this.exit_order      = zeros(10,1);
+            this.y_exit          = zeros(10,1);
+
+            % Aggiorna curriculum: ogni reset la difficoltà sale fino a 1.0
+            this.curriculum_level = min(1.0, this.curriculum_level + this.curriculum_step);
             this.cont_new_box    = 1;
             this.n_boxes_tot_vect = 2;
             this.n_boxes_tot     = 2;
@@ -257,9 +316,14 @@ classdef RL_environment1 < rl.env.MATLABEnvironment
             max_d_box = 2.0  * this.d_AMS;
             min_d_box = 0.25 * this.d_AMS;
 
-            % Genera diametri per tutti i possibili pacchi
+            % Curriculum: a livello basso tutti i pacchi hanno diametro medio
+            % (bassa varianza), a livello pieno varianza completa.
+            d_medio = (max_d_box + min_d_box) / 2;
             for ii = 1:this.max_gen_boxes
-                this.d_boxes(ii) = min_d_box + (max_d_box - min_d_box)*rand(1);
+                d_rand = min_d_box + (max_d_box - min_d_box)*rand(1);
+                % Interpola tra diametro fisso e casuale in base al curriculum
+                this.d_boxes(ii) = (1 - this.curriculum_level)*d_medio + ...
+                                        this.curriculum_level * d_rand;
             end
 
             % Posiziona i 2 pacchi iniziali (metà sinistra e metà destra)
@@ -334,95 +398,102 @@ classdef RL_environment1 < rl.env.MATLABEnvironment
         end
 
         % -----------------------------------------------------------------
-        % Reward function migliorata
+        % Reward function
+        % Per modificare i pesi, cambia le proprietà rw_* nella sezione
+        % "PESI REWARD" in cima al file — non serve toccare questo metodo.
         % -----------------------------------------------------------------
         function Reward = getReward(this, ~)
             Reward = 0;
 
-            % ----------------------------------------------------------
             % 1. PENALITÀ COLLISIONE proporzionale alla penetrazione
-            %    Più i pacchi si sovrappongono, più la penalità è alta.
-            %    Questo gradiente aiuta la rete a imparare ad evitare la
-            %    compenetrazione, non solo a non toccarsi.
-            % ----------------------------------------------------------
             for ii = 1:this.n_boxes_tot
                 for jj = ii+1 : this.n_boxes_tot
-                    if this.x_boxes(ii) < 0 || this.x_boxes(jj) < 0
-                        continue   % pacco non ancora generato (sentinella)
-                    end
-                    dx   = this.x_boxes(ii) - this.x_boxes(jj);
-                    dy   = this.y_boxes(ii) - this.y_boxes(jj);
-                    dist = sqrt(dx^2 + dy^2);
+                    if this.x_boxes(ii) < 0 || this.x_boxes(jj) < 0, continue; end
+                    dx = this.x_boxes(ii) - this.x_boxes(jj);
+                    dy = this.y_boxes(ii) - this.y_boxes(jj);
+                    dist     = sqrt(dx^2 + dy^2);
                     min_dist = (this.d_boxes(ii) + this.d_boxes(jj)) / 2;
                     if dist < min_dist
-                        penetrazione = min_dist - dist;          % [0, min_dist]
-                        % Penalità scalata: -50 per leggero contatto,
-                        % fino a -200 per sovrapposizione profonda
-                        Reward = Reward - 50 * (1 + 3*(penetrazione/min_dist));
+                        penetrazione = min_dist - dist;
+                        Reward = Reward + this.rw_collisione_base * (1 + 3*(penetrazione/min_dist));
                     end
                 end
             end
 
-            % ----------------------------------------------------------
-            % 2. PREMIO USCITA (delta): reward solo allo step in cui un
-            %    pacco esce, non ad ogni step successivo.
-            %    Senza delta, la reward cresceva indefinitamente e
-            %    mascherava i segnali negativi delle collisioni.
-            % ----------------------------------------------------------
+            % 2. PREMIO USCITA (delta: solo allo step in cui il pacco esce)
             n_nuovi_usciti = this.index_exit - this.index_exit_prev;
-            Reward = Reward + n_nuovi_usciti * 150;
+            Reward = Reward + n_nuovi_usciti * this.rw_uscita;
 
-            % ----------------------------------------------------------
-            % 3. PREMIO SINGOLAZIONE all'uscita
-            %    Quando due pacchi escono in momenti diversi e con un gap
-            %    laterale sufficiente, viene dato un bonus. Questo incentiva
-            %    la separazione spaziale (singolazione), obiettivo reale di
-            %    un sistema AMS.
-
-            %   NO (?) VOGLIAMO PREMIARE IL GAP VERTICALE
-            % ----------------------------------------------------------
+            % 3. PREMIO SINGOLAZIONE verticale (usa y_exit congelata)
             if this.index_exit >= 2
                 for kk = max(1, this.index_exit_prev+1) : this.index_exit
                     idx_uscito = this.exit_order(kk);
                     for mm = 1:kk-1
                         idx_prec = this.exit_order(mm);
                         if idx_uscito > 0 && idx_prec > 0
-                            sep_x = abs(this.x_boxes(idx_uscito) - this.x_boxes(idx_prec));
-                            soglia_sep = (this.d_boxes(idx_uscito) + this.d_boxes(idx_prec));
-                            if sep_x > soglia_sep
-                                Reward = Reward + 80;   % ben separati lateralmente
-                            elseif sep_x > soglia_sep * 0.5
-                                Reward = Reward + 20;   % parzialmente separati
+                            sep_y  = abs(this.y_exit(idx_uscito) - this.y_exit(idx_prec));
+                            soglia = (this.d_boxes(idx_uscito) + this.d_boxes(idx_prec));
+                            if sep_y > soglia
+                                Reward = Reward + this.rw_singolazione_ok;
+                            elseif sep_y > soglia * 0.5
+                                Reward = Reward + this.rw_singolazione_parz;
                             end
                         end
                     end
                 end
             end
 
-            % ----------------------------------------------------------
-            % 4. PREMIO THROUGHPUT (shaping continuo)
-            %    Incentiva i pacchi a muoversi verso l'uscita (Y crescente)
-            %    calcolando il progresso medio Y dei pacchi ancora in griglia.
-            %    Scala il contributo per non dominare sulla singolazione.
-            % ----------------------------------------------------------
+            % 4. SHAPING PROGRESSIVO per riga AMS (gradiente denso)
+            for ii = 1:this.n_boxes_tot
+                if this.pack_exited(ii) == 0 && this.x_boxes(ii) >= 0
+                    Reward = Reward + this.i_box(ii) * this.rw_shaping_riga;
+                end
+            end
+
+            % 5. PREMIO THROUGHPUT (velocità media Y dei pacchi in griglia)
             n_in_griglia = 0;
             progresso_y  = 0;
             for ii = 1:this.n_boxes_tot
                 if this.pack_exited(ii) == 0 && this.x_boxes(ii) >= 0
                     dy_step = this.y_boxes(ii) - this.y_boxes_prec(ii);
-                    progresso_y = progresso_y + max(0, dy_step);
+                    progresso_y  = progresso_y + max(0, dy_step);
                     n_in_griglia = n_in_griglia + 1;
                 end
             end
             if n_in_griglia > 0
-                Reward = Reward + 10 * (progresso_y / n_in_griglia) / this.dt;
+                Reward = Reward + this.rw_throughput * (progresso_y / n_in_griglia) / this.dt;
             end
 
-            % ----------------------------------------------------------
-            % 5. PENALITÀ STAZIONAMENTO (invariata)
-            %    Piccolo costo fisso per step per disincentivare inerzia.
-            % ----------------------------------------------------------
-            Reward = Reward - 0.5;
+            % 6. PREMIO ALLINEAMENTO IN FILA INDIANA
+            %    Premia ogni coppia di pacchi che è contemporaneamente:
+            %      a) separata verticalmente (gap Y > somma raggi → no collisione)
+            %      b) allineata lateralmente  (gap X < soglia → stessa corsia)
+            %      c) entrambi ancora in griglia
+            %    Il premio è dato ad ogni step: incentiva il mantenimento
+            %    della configurazione a fila indiana durante tutta la traversata.
+            for ii = 1:this.n_boxes_tot
+                for jj = ii+1 : this.n_boxes_tot
+                    % Salta pacchi non ancora generati o già usciti
+                    if this.x_boxes(ii) < 0 || this.x_boxes(jj) < 0, continue; end
+                    if this.pack_exited(ii) || this.pack_exited(jj),  continue; end
+
+                    dx = abs(this.x_boxes(ii) - this.x_boxes(jj));
+                    dy = abs(this.y_boxes(ii) - this.y_boxes(jj));
+
+                    somma_raggi = (this.d_boxes(ii) + this.d_boxes(jj)) / 2;
+                    soglia_x    = somma_raggi * this.rw_allineamento_soglia_x;
+
+                    sep_v_ok  = dy > somma_raggi;   % a) separati verticalmente
+                    allin_ok  = dx < soglia_x;       % b) allineati lateralmente
+
+                    if sep_v_ok && allin_ok
+                        Reward = Reward + this.rw_allineamento;
+                    end
+                end
+            end
+
+            % 7. PENALITÀ STAZIONAMENTO (costo fisso per step)
+            Reward = Reward + this.rw_stazionamento;
         end
 
         % -----------------------------------------------------------------
