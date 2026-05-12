@@ -1,63 +1,24 @@
-
 clear all
 close all
 clc
 
-%%
+%% Carica ambiente
+env = RL_environment1();
 
-% load the RL environment
-
-env=RL_environment1();
-
-doTraining = false;
+doTraining = true;
 
 if doTraining
 
     actInfo = getActionInfo(env);
     obsInfo = getObservationInfo(env);
-<<<<<<< Updated upstream
-
-    numObs = prod(obsInfo.Dimension);
-    criticLayerSizes = [512 256 128];
-    actorLayerSizes = [512 256 128];
-
-    % Critic
-
-    criticNetwork = [
-        featureInputLayer(numObs)
-        fullyConnectedLayer(criticLayerSizes(1), ...
-        Weights=sqrt(2/numObs)*...
-        (rand(criticLayerSizes(1),numObs)-0.5), ...
-        Bias=1e-3*ones(criticLayerSizes(1),1))
-        reluLayer
-        fullyConnectedLayer(criticLayerSizes(2), ...
-        Weights=sqrt(2/criticLayerSizes(1))*...
-        (rand(criticLayerSizes(2),criticLayerSizes(1))-0.5), ...
-        Bias=1e-3*ones(criticLayerSizes(2),1))
-        reluLayer
-        fullyConnectedLayer(criticLayerSizes(3), ...
-        Weights=sqrt(2/criticLayerSizes(2))*...
-        (rand(criticLayerSizes(3),criticLayerSizes(2))-0.5), ...
-        Bias=1e-3*ones(criticLayerSizes(3),1))
-        reluLayer
-        fullyConnectedLayer(1, ...
-        Weights=sqrt(2/criticLayerSizes(3))* ...
-        (rand(1,criticLayerSizes(3))-0.5), ...
-        Bias=1e-3)
-=======
     numObs  = prod(obsInfo.Dimension);   % 100
     numAct  = prod(actInfo.Dimension);   % 50
 
     % =====================================================================
-    % Architettura reti  [RIDOTTA a 256-128]
-    %
-    % Motivazione: reti più piccole convergono più velocemente con pochi
-    % dati e hanno meno rischio di overfitting alle prime esperienze.
-    % 512-256-128 è eccessivo per uno spazio di stato/azione sparse
-    % (molte celle AMS vuote). 256-128 è un buon compromesso.
+    % Architettura reti  
     % =====================================================================
-    criticLayerSizes = [256 128];
-    actorLayerSizes  = [256 128];
+    criticLayerSizes = [512 256 128];
+    actorLayerSizes  = [512 256 128];
 
     % =====================================================================
     % Critic (Value Function)  — 100 → 256 → 128 → 1
@@ -75,16 +36,8 @@ if doTraining
         fullyConnectedLayer(1, ...
             Weights=sqrt(2/criticLayerSizes(2)) * (rand(1,criticLayerSizes(2))-0.5), ...
             Bias=1e-3)
->>>>>>> Stashed changes
         ];
     criticNetwork = dlnetwork(criticNetwork);
-<<<<<<< Updated upstream
-    summary(criticNetwork)
-
-    critic = rlValueFunction(criticNetwork,obsInfo);
-
-    % Actor
-=======
     critic = rlValueFunction(criticNetwork, obsInfo);
 
     % =====================================================================
@@ -100,10 +53,9 @@ if doTraining
     % l'uscita iniziale sia ~ softplus(-2) + 0.05 ≈ 0.17 (range utile).
     % =====================================================================
     std_min = 0.05;   % std minima per ogni azione
->>>>>>> Stashed changes
 
     inPath = [
-        featureInputLayer(numObs,Name="netOin")
+        featureInputLayer(numObs, Name="netOin")
         fullyConnectedLayer(actorLayerSizes(1))
         reluLayer
         fullyConnectedLayer(actorLayerSizes(2))
@@ -111,28 +63,17 @@ if doTraining
         ];
 
     meanPath = [
-<<<<<<< Updated upstream
-        fullyConnectedLayer(actorLayerSizes(3),Name="MeanLyr")
-        reluLayer
-        fullyConnectedLayer(prod(actInfo.Dimension),Name="meanOutLyr")
-        tanhLayer(Name="thmeanOutLyr");
-=======
         fullyConnectedLayer(actorLayerSizes(2), Name="MeanLyr")
         reluLayer
         fullyConnectedLayer(numAct, Name="meanOutLyr", ...
             Bias=zeros(numAct,1))   % bias=0 → policy inizia centrata
         tanhLayer(Name="thmeanOutLyr")
->>>>>>> Stashed changes
         ];
 
     % std_min via bias inizializzato: softplus(x+b)+std_min
     % Per avere std_init ≈ 0.2: softplus(-1) ≈ 0.31 → bias=-1 → ok
     sdevPath = [
-<<<<<<< Updated upstream
-        fullyConnectedLayer(actorLayerSizes(3),Name="StdLyr")
-=======
         fullyConnectedLayer(actorLayerSizes(2), Name="StdLyr")
->>>>>>> Stashed changes
         reluLayer
         fullyConnectedLayer(numAct, ...
             Bias=-1*ones(numAct,1))  % std iniziale ≈ softplus(-1)+0.05 ≈ 0.36
@@ -145,147 +86,96 @@ if doTraining
     % Per un controllo più fine, usare un customLayer che calcola
     % softplus(x) + std_min — vedere commento in fondo al file.
 
-    % Add layers to network object
     net = layerGraph(inPath);
-    net = addLayers(net,meanPath);
-    net = addLayers(net,sdevPath);
-
-    % Connect layers
-    net = connectLayers(net,"relulast","MeanLyr/in");
-    net = connectLayers(net,"relulast","StdLyr/in");
-
+    net = addLayers(net, meanPath);
+    net = addLayers(net, sdevPath);
+    net = connectLayers(net, "relulast", "MeanLyr/in");
+    net = connectLayers(net, "relulast", "StdLyr/in");
     net = dlnetwork(net);
 
     actor = rlContinuousGaussianActor(net, obsInfo, actInfo, ...
-        ActionMeanOutputNames="thmeanOutLyr",...
-        ActionStandardDeviationOutputNames="stdOutLyr",...
+        ActionMeanOutputNames="thmeanOutLyr", ...
+        ActionStandardDeviationOutputNames="stdOutLyr", ...
         ObservationInputNames="netOin");
 
-<<<<<<< Updated upstream
-    % Train
-
-    actorOpts = rlOptimizerOptions(LearnRate=1e-4);
-    criticOpts = rlOptimizerOptions(LearnRate=1e-4);
-
-    agentOpts = rlPPOAgentOptions(...
-        ExperienceHorizon=500,...
-        ClipFactor=0.02,...
-        EntropyLossWeight=0.01,...
-        ActorOptimizerOptions=actorOpts,...
-        CriticOptimizerOptions=criticOpts,...
-        NumEpoch=3,...
-        AdvantageEstimateMethod="gae",...
-        GAEFactor=0.95,...
-        SampleTime=0.01,...
-        DiscountFactor=0.99);
-=======
     % =====================================================================
-    % Opzioni PPO
+    % Opzioni PPO — fix critic che non converge (Q0/reward ≈ 0.22×)
     %
-    % Allineate al paper (Tabella 1) con piccole correzioni pratiche:
+    % PROBLEMA: con γ=0.99 e T=1000, il ritorno atteso G_t = Σγ^k·r_{t+k}
+    % vale fino a r·(1-γ^T)/(1-γ) ≈ 0.23/0.01 ≈ 23 per ogni step.
+    % Il critic deve stimare valori molto grandi da osservazioni sparse
+    % → lento e impreciso → advantage sbagliati → plateau.
     %
-    %   ExperienceHorizon  2048  → nsteps paper
-    %   ClipFactor         0.2   → ε_π = ε_V paper
-    %   EntropyLossWeight  1e-4  → c2 paper (basso: std già limitata)
-    %   NumEpoch           10    → ridotto da 50: evita overfitting su
-    %                              batch piccoli nelle prime fasi curriculum
-    %   MiniBatchSize      64    → paper
-    %   LR actor/critic    3e-4  → paper (Adam)
-    %   GAEFactor          0.95  → λ paper
-    %   DiscountFactor     0.99  → γ paper
+    % FIX:
+    %   DiscountFactor 0.99 → 0.97
+    %     Orizzonte effettivo: 1/(1-γ) = 33 step invece di 100.
+    %     Valori critic max ≈ 0.23/0.03 ≈ 8 → molto più facile da stimare.
+    %     La policy rimane lungimirante (33 step = 0.33s a dt=0.01).
+    %
+    %   MaxStepsPerEpisode 1000 → 500
+    %     Con v_treadmill=1.9 m/s tutti i pacchi escono in max ~200 step.
+    %     500 step è abbondante, dimezza il tempo per episodio e rende
+    %     il segnale più denso (meno step vuoti a fine episodio).
+    %
+    %   LR critic 5e-4 → 8e-4
+    %     Accelera la convergenza del critic senza destabilizzare.
     % =====================================================================
     actorOpts  = rlOptimizerOptions(LearnRate=3e-4);
-    criticOpts = rlOptimizerOptions(LearnRate=3e-4);
+    criticOpts = rlOptimizerOptions(LearnRate=8e-4);
 
     agentOpts = rlPPOAgentOptions( ...
-        ExperienceHorizon    = 2048,  ...
-        ClipFactor           = 0.2,   ...
-        EntropyLossWeight    = 1e-4,  ...
-        ActorOptimizerOptions  = actorOpts,  ...
-        CriticOptimizerOptions = criticOpts, ...
-        NumEpoch             = 10,    ...
+        ExperienceHorizon       = 2048,  ...
+        ClipFactor              = 0.2,   ...
+        EntropyLossWeight       = 0.02,  ...
+        ActorOptimizerOptions   = actorOpts,  ...
+        CriticOptimizerOptions  = criticOpts, ...
+        NumEpoch                = 5,     ...
         AdvantageEstimateMethod = "gae", ...
-        GAEFactor            = 0.95,  ...
-        SampleTime           = 0.01,  ...
-        DiscountFactor       = 0.99,  ...
-        MiniBatchSize        = 64);
->>>>>>> Stashed changes
+        GAEFactor               = 0.95,  ...
+        SampleTime              = 0.01,  ...
+        DiscountFactor          = 0.97,  ...
+        MiniBatchSize           = 256);
 
-    agent = rlPPOAgent(actor,critic,agentOpts);
+    agent = rlPPOAgent(actor, critic, agentOpts);
 
-<<<<<<< Updated upstream
-    trainOpts = rlTrainingOptions(...
-        MaxEpisodes=25000,...
-        MaxStepsPerEpisode=1000,...
-        Plots="training-progress",...
-        StopTrainingCriteria="AverageReward",...
-        StopTrainingValue=40000,...
-        ScoreAveragingWindowLength=100);
-=======
     % =====================================================================
-    % Opzioni di training
+    % Opzioni di training — singolo train(), nessun loop a blocchi
     %
-    % Nuova scala reward: ≈ [−0.3, 1.3] per step × 1000 step/ep → [−300, 1300]
-    % Soglia stop: 800 (media su 100 ep) → policy quasi-ottima
-    % Checkpoint ogni 500 ep (invariato)
+    % Reward attesa: ∈ [0,1] per step × 500 step/ep → max ~500/ep
+    % Stop a 375 (media su 100 ep) = ~75% del massimo
+    % Checkpoint ogni 500 episodi
     % =====================================================================
     trainOpts = rlTrainingOptions( ...
-        MaxEpisodes             = 25000,           ...
-        MaxStepsPerEpisode      = 1000,            ...
+        MaxEpisodes             = 25000,               ...
+        MaxStepsPerEpisode      = 500,                 ...
         Plots                   = "training-progress", ...
-        StopTrainingCriteria    = "AverageReward", ...
-        StopTrainingValue       = 800,             ...
-        ScoreAveragingWindowLength = 100,          ...
-        SaveAgentCriteria       = "EpisodeFrequency", ...
-        SaveAgentValue          = 500,             ...
+        StopTrainingCriteria    = "AverageReward",     ...
+        StopTrainingValue       = 375,                 ...
+        ScoreAveragingWindowLength = 100,              ...
+        SaveAgentCriteria       = "EpisodeFrequency",  ...
+        SaveAgentValue          = 500,                 ...
         SaveAgentDirectory      = "agents_checkpoint");
->>>>>>> Stashed changes
 
-    % --- Training ---
     trainingStats = train(agent, env, trainOpts);
 
-<<<<<<< Updated upstream
-    save("agent_trained","agent");
-    save("trainingStats","trainingStats");
-=======
     save("agent_trained",  "agent");
     save("trainingStats",  "trainingStats");
->>>>>>> Stashed changes
 
 else
-
-    % load saved agent
-    % Carica l'agente precedentemente salvato
     load('agent_trained.mat', 'agent');
-<<<<<<< Updated upstream
-    
-    % (Opzionale) Visualizza l'agente per conferma
-    fprintf('Agente caricato correttamente. Pronto per il test.\n');
-
-end
-
-%% simulation of the sorting after training
-
-env.reset();
-
-plot(env)
-=======
     fprintf('Agente caricato. Pronto per il test.\n');
 end
 
 %% =====================================================================
 %  Simulazione post-training
 % =====================================================================
-env.reset();
+reset(env);
 plot(env, 'full')   % usa il visualizzatore completo con frecce AMS
->>>>>>> Stashed changes
 
 rng(10)
 simOptions = rlSimulationOptions(MaxSteps=10000);
 simOptions.NumSimulations = 10;
 experience = sim(env, agent, simOptions);
-<<<<<<< Updated upstream
-=======
 
 % =====================================================================
 %  NOTA: CustomLayer per std_min (opzionale, più preciso)
@@ -304,4 +194,3 @@ experience = sim(env, agent, simOptions);
 % e sostituire softplusLayer(Name="stdOutLyr") con
 %   ShiftedSoftplusLayer(Name="stdOutLyr")
 % impostando this.shift = std_min.
->>>>>>> Stashed changes
